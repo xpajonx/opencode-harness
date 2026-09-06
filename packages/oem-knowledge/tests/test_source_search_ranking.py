@@ -12,6 +12,7 @@ from oem_knowledge.services.source_corpus import (
     _extract_source_identifiers,
     _has_boundary_identifier_match,
     _matched_source_identifiers,
+    SourceCorpusService,
 )
 
 
@@ -302,6 +303,76 @@ class TestSearchRankingIntegration:
                 "end_line": len(document.splitlines()),
             })
         return rows
+
+    @pytest.mark.parametrize(
+        ("query", "document", "bm25_score", "dense_score", "expected_status", "expected_evidence", "expected_threshold", "expected_component_match"),
+        [
+            ("source", "class SourceManifest: pass", 0.0, 0.30, "success", True, 0.25, True),
+            ("quantum entanglement laboratory measurements", "def actual_handler(): return 1", 0.0, 0.50, "no_relevant_source_results", False, 0.55, False),
+            ("quantum entanglement laboratory measurements", "def actual_handler(): return 1", 0.0, 0.60, "success", True, 0.55, False),
+            ("quantum entanglement laboratory measurements", "def actual_handler(): return 1", 0.10, 0.30, "success", True, 0.25, False),
+        ],
+    )
+    def test_hybrid_dense_evidence_uses_conditional_threshold(
+        self,
+        engine,
+        query,
+        document,
+        bm25_score,
+        dense_score,
+        expected_status,
+        expected_evidence,
+        expected_threshold,
+        expected_component_match,
+    ):
+        class DenseFakeStore:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def iter_chunks(self):
+                return self.rows
+
+            def load_embeddings(self, model_name, dimension):
+                assert dimension == 2
+                return {
+                    (row["id"], row["content_hash"]): [
+                        dense_score,
+                        (1.0 - dense_score**2) ** 0.5,
+                    ]
+                    for row in self.rows
+                }
+
+            def close(self):
+                pass
+
+        rows = self._make_mock_rows(
+            [("src/implementation.py", document, None)]
+        )
+        rows[0]["content_hash"] = "hash-1"
+        model_name = engine.resolve_embedding_model()
+        manifest = {
+            "embedding": {"status": "ready", "model": model_name, "dimension": 2}
+        }
+        with patch(
+            "oem_knowledge.services.source_corpus._SourceIndexStore",
+            return_value=DenseFakeStore(rows),
+        ), patch.object(engine.source, "_load_manifest", return_value=manifest), patch.object(
+            engine.source, "_bm25_scores", return_value=[bm25_score]
+        ), patch.object(engine.search, "set_retrieval_mode", wraps=engine.search.set_retrieval_mode), patch.object(
+            engine.search, "embed", return_value=[[1.0, 0.0]]
+        ):
+            engine.search.set_retrieval_mode("hybrid")
+            result = engine.source.search(query, k=1)
+
+        assert result["status"] == expected_status
+        if result["results"]:
+            diagnostics = result["results"][0]["metadata"]["source_diagnostics"]
+            assert diagnostics["dense_available"] is True
+            assert diagnostics["dense_evidence"] is expected_evidence
+            assert diagnostics["dense_evidence_threshold"] == expected_threshold
+            assert diagnostics["lexical_component_match"] is expected_component_match
+        else:
+            assert expected_status == "no_relevant_source_results"
 
     def test_agents_md_penalized_over_implementation(self, engine):
         """AGENTS.md should rank below implementation code for a code query."""
@@ -845,7 +916,7 @@ class TestIndexedSearchRanking:
 
     def test_implementation_code_boost_requires_positive_evidence(self, indexed_engine):
         # If we query an unrelated term that exists nowhere, normal results are empty
-        res = indexed_engine.source.search("unrelated_query_evidence_check")
+        res = indexed_engine.source.search("quantum entanglement laboratory measurements")
         assert res["status"] == "no_relevant_source_results"
         assert len(res["results"]) == 0
 
@@ -1057,8 +1128,3 @@ class TestMatchedSourceIdentifiers:
         doc = "foo matches, but bar matches too, not bazz"
         matched = _matched_source_identifiers(identifiers, doc)
         assert matched == ["foo", "bar"]
-
-
-
-
-

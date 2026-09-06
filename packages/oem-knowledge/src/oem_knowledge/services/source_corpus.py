@@ -241,6 +241,23 @@ def _path_tokens(rel_path: str) -> set[str]:
     return expanded
 
 
+def _source_component_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for original in re.findall(r"\w+", text):
+        lowered = original.lower()
+        if len(lowered) > 1 and lowered not in SOURCE_STOPWORDS:
+            tokens.add(lowered)
+        for underscore_part in original.split("_"):
+            for component in re.findall(
+                r"[A-Z]+(?=[A-Z][a-z]|$)|[A-Z]?[a-z]+|[A-Z]+|\d+",
+                underscore_part,
+            ):
+                lowered_component = component.lower()
+                if len(lowered_component) > 1 and lowered_component not in SOURCE_STOPWORDS:
+                    tokens.add(lowered_component)
+    return tokens
+
+
 def _extract_symbols(text: str) -> list[str]:
     symbols = []
     seen = set()
@@ -308,6 +325,7 @@ PENALTY_METADATA_ONLY = 10.0
 MIN_POSITIVE_RESULT_SCORE = 0.0
 WEAK_RESULT_MIN_SCORE = 5.0
 SOURCE_DENSE_EVIDENCE_THRESHOLD = 0.25
+SOURCE_DENSE_NO_LEXICAL_EVIDENCE_THRESHOLD = 0.55
 SCORE_TIE_EPSILON = 1e-9
 
 # BM25 normalization parameters (used in _bm25_scores)
@@ -1606,7 +1624,7 @@ class SourceCorpusService:
         query_terms = [term.lower() for term in re.findall(r"\w+", query) if len(term) > 1]
         if not query_terms or not documents:
             return [0.0] * len(documents)
-        tokenized = [[term.lower() for term in re.findall(r"\w+", doc)] for doc in documents]
+        tokenized = [re.findall(r"\w+", doc.lower()) for doc in documents]
         doc_count = len(tokenized)
         df: dict[str, int] = {}
         for terms in tokenized:
@@ -1756,9 +1774,19 @@ class SourceCorpusService:
 
             matched_identifiers = _matched_source_identifiers(identifiers, document)
             matched_identifier_count = len(matched_identifiers)
+            lexical_component_match = bool(
+                _source_component_tokens(query) & _source_component_tokens(document)
+            )
+            dense_evidence_threshold = (
+                SOURCE_DENSE_EVIDENCE_THRESHOLD
+                if normalized_base_score > 0.0
+                or matched_identifier_count > 0
+                or lexical_component_match
+                else SOURCE_DENSE_NO_LEXICAL_EVIDENCE_THRESHOLD
+            )
             dense_evidence = (
                 dense_available
-                and dense_score >= SOURCE_DENSE_EVIDENCE_THRESHOLD
+                and dense_score >= dense_evidence_threshold
                 and (not identifiers or matched_identifier_count > 0)
             )
 
@@ -1939,6 +1967,8 @@ class SourceCorpusService:
                 "bm25_score": round(normalized_base_score, 4),
                 "dense_score": round(dense_score, 4),
                 "dense_evidence": dense_evidence,
+                "dense_evidence_threshold": dense_evidence_threshold,
+                "lexical_component_match": lexical_component_match,
                 "final_score": final_score,
                 "ranking_reason": reasons,
                 "ranking_boosts": boosts,
