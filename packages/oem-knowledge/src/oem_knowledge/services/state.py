@@ -846,9 +846,13 @@ class StateService:
         return {"status": "success", "explanation": summary}
 
     def merge_concepts(
-        self, project: str | None = None, primary_id: str = "", secondary_id: str = ""
+        self,
+        project: str | None = None,
+        primary_id: str = "",
+        secondary_id: str = "",
+        lock: bool = True,
     ) -> dict:
-        registry = self._load_registry(project)
+        registry = self._load_registry(project, lock=lock)
         if primary_id not in registry or secondary_id not in registry:
             return {"status": "error", "message": "One or both concepts not found."}
 
@@ -871,11 +875,11 @@ class StateService:
         pdata["session_count"] = len(pdata["sessions"])
 
         del registry[secondary_id]
-        self._save_registry(registry, project)
+        self._save_registry(registry, project, lock=lock)
 
         pdata = self.evaluate_concept_status(pdata, "merge", "system")
         registry[primary_id] = pdata
-        self._save_registry(registry, project)
+        self._save_registry(registry, project, lock=lock)
 
         concepts_dir = self.engine._concepts_dir(project)
         sf = concepts_dir / f"{secondary_id}.md"

@@ -66,9 +66,15 @@ class ConceptEvolutionEngine:
             "learnings_count": len(unique_learnings)
         }
 
-    def propose_merges(self, similarity_threshold: float = 0.85, project: str | None = None) -> list[dict]:
+    def propose_merges(
+        self,
+        similarity_threshold: float = 0.85,
+        project: str | None = None,
+        *,
+        lock: bool = True,
+    ) -> list[dict]:
         """Propose merging concepts with highly similar canonical names or aliases."""
-        registry = self.engine.state._load_registry(project)
+        registry = self.engine.state._load_registry(project, lock=lock)
         cids = list(registry.keys())
         proposals = []
         

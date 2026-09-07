@@ -1289,237 +1289,243 @@ class SourceCorpusService:
         return record, chunks, char_count
 
     def index(self, force: bool = False, dry_run: bool = False) -> dict[str, Any]:
-        project_root = self._project_root()
-        effective_config = self.load_config()
-        config = {
-            "version": DEFAULT_SOURCE_CONFIG["version"],
-            "include": list(effective_config.include),
-            "exclude": list(effective_config.exclude),
-            "chunk_lines": effective_config.chunk_lines,
-            "chunk_overlap_lines": effective_config.chunk_overlap_lines,
-            "max_file_size_bytes": effective_config.max_file_size_bytes,
-            "max_read_lines": effective_config.max_read_lines,
-            "max_read_characters": effective_config.max_read_characters,
-            "exclude_globs": list(effective_config.exclude_globs),
-        }
-        previous_manifest = self._load_manifest()
-        previous_files = previous_manifest.get("files", {}) if isinstance(previous_manifest, dict) else {}
-        previous_config = previous_manifest.get("config", {}) if isinstance(previous_manifest, dict) else {}
-        if not force and previous_config and previous_config != config:
-            force = True
-
-        if not dry_run and not self._memory_root().exists():
-            self.engine.init_project(str(project_root))
-        if not dry_run:
-            self._ensure_config_written(config)
-
-        discovered, counters = self._discover_files(config)
-        discovered_map = {item["rel_path"]: item for item in discovered}
-        removed_files = sorted(set(previous_files) - set(discovered_map))
-
-        stats = {
-            "status": "success",
-            "operation": "knowledge_source_index",
-            "mode": "dry_run" if dry_run else "write",
-            "scanned_files": len(discovered),
-            "indexed_files": 0,
-            "metadata_only_files": 0,
-            "new_files": 0,
-            "updated_files": 0,
-            "unchanged_files": 0,
-            "removed_files": len(removed_files),
-            "skipped_large_files": counters["skipped_large_file"],
-            "lockfile_metadata_only_files": counters["lockfile_metadata_only"],
-            "excluded_files": counters["excluded"],
-            "total_chunks": 0,
-            "estimated_source_tokens": 0,
-        }
-        manifest_files: dict[str, Any] = {}
-        total_chars = 0
-
-        store = None if dry_run else self._store_for_write()
-        for rel_path, file_info in discovered_map.items():
-            record, chunks, indexed_chars = self._chunk_file(file_info, config)
-            previous = previous_files.get(rel_path)
-            is_unchanged = (
-                not force
-                and isinstance(previous, dict)
-                and previous.get("content_hash") == record["content_hash"]
-                and int(previous.get("mtime_ns", -1)) == int(record["mtime_ns"])
-                and previous.get("status") == record["status"]
-                and int(previous.get("chunk_count", -1)) == int(record["chunk_count"])
-            )
-            if is_unchanged:
-                stats["unchanged_files"] += 1
-            elif previous is None:
-                stats["new_files"] += 1
-            else:
-                stats["updated_files"] += 1
-
-            if record["status"] == "indexed":
-                stats["indexed_files"] += 1
-            else:
-                stats["metadata_only_files"] += 1
-
-            stats["total_chunks"] += record["chunk_count"]
-            total_chars += indexed_chars
-            manifest_files[rel_path] = {
-                "status": record["status"],
-                "content_hash": record["content_hash"],
-                "mtime_ns": record["mtime_ns"],
-                "chunk_count": record["chunk_count"],
-                "size_bytes": record["size_bytes"],
-                "line_count": record["line_count"],
-                "metadata": record["metadata"],
+        from oem_knowledge.fs import FileLock
+        manifest_lock = FileLock(
+            self._manifest_path().with_suffix(".lock"),
+            timeout=60.0,
+        )
+        with manifest_lock:
+            project_root = self._project_root()
+            effective_config = self.load_config()
+            config = {
+                "version": DEFAULT_SOURCE_CONFIG["version"],
+                "include": list(effective_config.include),
+                "exclude": list(effective_config.exclude),
+                "chunk_lines": effective_config.chunk_lines,
+                "chunk_overlap_lines": effective_config.chunk_overlap_lines,
+                "max_file_size_bytes": effective_config.max_file_size_bytes,
+                "max_read_lines": effective_config.max_read_lines,
+                "max_read_characters": effective_config.max_read_characters,
+                "exclude_globs": list(effective_config.exclude_globs),
             }
-            if store is not None and not is_unchanged:
-                store.replace_file(record, chunks)
+            previous_manifest = self._load_manifest()
+            previous_files = previous_manifest.get("files", {}) if isinstance(previous_manifest, dict) else {}
+            previous_config = previous_manifest.get("config", {}) if isinstance(previous_manifest, dict) else {}
+            if not force and previous_config and previous_config != config:
+                force = True
 
-        if store is not None and removed_files:
-            store.remove_files(removed_files)
+            if not dry_run and not self._memory_root().exists():
+                self.engine.init_project(str(project_root))
+            if not dry_run:
+                self._ensure_config_written(config)
 
-        stats["estimated_source_tokens"] = _estimate_tokens(total_chars)
-        summary = {
-            "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "project_root": str(project_root),
-            "indexed_files": stats["indexed_files"],
-            "metadata_only_files": stats["metadata_only_files"],
-            "removed_files": stats["removed_files"],
-            "skipped_large_files": stats["skipped_large_files"],
-            "lockfile_metadata_only_files": stats["lockfile_metadata_only_files"],
-            "excluded_files": stats["excluded_files"],
-            "total_chunks": stats["total_chunks"],
-            "estimated_source_tokens": stats["estimated_source_tokens"],
-            "max_file_size_bytes": int(config["max_file_size_bytes"]),
-            "max_read_lines": int(config["max_read_lines"]),
-            "max_read_characters": int(config["max_read_characters"]),
-        }
+            discovered, counters = self._discover_files(config)
+            discovered_map = {item["rel_path"]: item for item in discovered}
+            removed_files = sorted(set(previous_files) - set(discovered_map))
 
-        embedding_status = None
-        embedding_failure = None
-        embedding_manifest = previous_manifest.get("embedding") if isinstance(previous_manifest, dict) else None
-        if not dry_run:
-            # Embeddings are deliberately a second transaction after text indexing.
-            try:
-                mode = self.engine.search.resolve_retrieval_mode() if self.engine is not None else "bm25"
-                if mode == "hybrid":
-                    if store is None:
-                        raise RuntimeError("source_store_unavailable")
-                    model_name = self.engine.resolve_embedding_model()
-                    current_chunks = store.iter_chunks()
-                    if current_chunks:
-                        active = previous_manifest.get("embedding", {}) if isinstance(previous_manifest, dict) else {}
-                        active_model = active.get("model")
-                        try:
-                            active_dimension = int(active.get("dimension") or 0)
-                        except (TypeError, ValueError):
-                            active_dimension = 0
-                        existing_rows = store.conn.execute(
-                            "SELECT chunk_id, content_hash, embedding_dimension "
-                            "FROM source_embeddings WHERE embedding_model = ?",
-                            (model_name,),
-                        ).fetchall()
-                        existing_dimensions = {
-                            (row["chunk_id"], row["content_hash"]): int(row["embedding_dimension"])
-                            for row in existing_rows
-                        }
-                        probe = self.engine.search.embed([current_chunks[0]["document"]])
-                        if len(probe) != 1 or not probe[0]:
-                            raise ValueError("invalid_embedding_probe")
-                        observed_dimension = len(probe[0])
-                        if observed_dimension <= 0:
-                            raise ValueError("invalid_embedding_dimension")
-                        dimension = observed_dimension
-                        missing = [
-                            chunk
-                            for chunk in current_chunks
-                            if existing_dimensions.get((chunk["id"], chunk["content_hash"])) != dimension
-                        ]
-                        if active_model != model_name or active_dimension != dimension:
-                            missing = current_chunks
-                        if missing:
-                            vectors = self.engine.search.embed([chunk["document"] for chunk in missing])
-                            if len(vectors) != len(missing) or not vectors:
-                                raise ValueError("invalid_embedding_batch")
-                            if any(not vector or len(vector) != dimension for vector in vectors):
-                                raise ValueError("inconsistent_embedding_dimensions")
-                            if any(
-                                not math.isfinite(float(value))
-                                for vector in vectors
-                                for value in vector
-                            ):
-                                raise ValueError("non_finite_embedding")
-                            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                            generation = f"{model_name}:{dimension}"
-                            rows_to_write = [
-                                {
-                                    "chunk_id": chunk["id"],
-                                    "embedding_generation": generation,
-                                    "embedding_model": model_name,
-                                    "embedding_dimension": dimension,
-                                    "content_hash": chunk["content_hash"],
-                                    "embedding": json.dumps([float(value) for value in vector]),
-                                    "created_at": now,
-                                }
-                                for chunk, vector in zip(missing, vectors)
-                            ]
-                            store.upsert_embeddings(rows_to_write)
-                        generation = f"{model_name}:{dimension}"
-                        stored = store.load_embeddings(model_name, dimension)
-                        if not all(
-                            (chunk["id"], chunk["content_hash"]) in stored
-                            for chunk in current_chunks
-                        ):
-                            raise ValueError("incomplete_embedding_generation")
-                        count = store.conn.execute(
-                            "SELECT COUNT(*) FROM source_embeddings "
-                            "WHERE embedding_generation = ?",
-                            (generation,),
-                        ).fetchone()[0]
-                        embedding_manifest = {
-                            "active_generation": generation,
-                            "model": model_name,
-                            "dimension": dimension,
-                            "status": "ready",
-                            "embedded_chunks": count,
-                        }
-                        embedding_status = "ready"
-                    else:
-                        embedding_status = "no_chunks"
+            stats = {
+                "status": "success",
+                "operation": "knowledge_source_index",
+                "mode": "dry_run" if dry_run else "write",
+                "scanned_files": len(discovered),
+                "indexed_files": 0,
+                "metadata_only_files": 0,
+                "new_files": 0,
+                "updated_files": 0,
+                "unchanged_files": 0,
+                "removed_files": len(removed_files),
+                "skipped_large_files": counters["skipped_large_file"],
+                "lockfile_metadata_only_files": counters["lockfile_metadata_only"],
+                "excluded_files": counters["excluded"],
+                "total_chunks": 0,
+                "estimated_source_tokens": 0,
+            }
+            manifest_files: dict[str, Any] = {}
+            total_chars = 0
+
+            store = None if dry_run else self._store_for_write()
+            for rel_path, file_info in discovered_map.items():
+                record, chunks, indexed_chars = self._chunk_file(file_info, config)
+                previous = previous_files.get(rel_path)
+                is_unchanged = (
+                    not force
+                    and isinstance(previous, dict)
+                    and previous.get("content_hash") == record["content_hash"]
+                    and int(previous.get("mtime_ns", -1)) == int(record["mtime_ns"])
+                    and previous.get("status") == record["status"]
+                    and int(previous.get("chunk_count", -1)) == int(record["chunk_count"])
+                )
+                if is_unchanged:
+                    stats["unchanged_files"] += 1
+                elif previous is None:
+                    stats["new_files"] += 1
                 else:
-                    embedding_status = "bm25"
-            except Exception as exc:
-                embedding_status = "bm25_fallback"
-                embedding_failure = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(exc))[:80] or "embedding_unavailable"
-            manifest = {
-                "version": "1.0.1",
-                "corpus": "source",
-                "config": config,
-                "summary": summary,
-                "files": manifest_files,
-            }
-            if embedding_manifest:
-                manifest["embedding"] = embedding_manifest
-            manifest_path = self._manifest_path()
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = manifest_path.with_name(manifest_path.name + ".tmp")
-            try:
-                temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-                os.replace(temporary, manifest_path)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
+                    stats["updated_files"] += 1
 
-        stats["summary"] = summary
-        stats["warnings"] = []
-        if embedding_status:
-            stats["embedding_status"] = embedding_status
-        if embedding_failure:
-            stats["embedding_failure"] = embedding_failure
-            stats["warnings"].append(f"source_embedding_fallback:{embedding_failure}")
-        if dry_run:
-            stats["warnings"].append("dry_run_no_files_written")
-        return stats
+                if record["status"] == "indexed":
+                    stats["indexed_files"] += 1
+                else:
+                    stats["metadata_only_files"] += 1
+
+                stats["total_chunks"] += record["chunk_count"]
+                total_chars += indexed_chars
+                manifest_files[rel_path] = {
+                    "status": record["status"],
+                    "content_hash": record["content_hash"],
+                    "mtime_ns": record["mtime_ns"],
+                    "chunk_count": record["chunk_count"],
+                    "size_bytes": record["size_bytes"],
+                    "line_count": record["line_count"],
+                    "metadata": record["metadata"],
+                }
+                if store is not None and not is_unchanged:
+                    store.replace_file(record, chunks)
+
+            if store is not None and removed_files:
+                store.remove_files(removed_files)
+
+            stats["estimated_source_tokens"] = _estimate_tokens(total_chars)
+            summary = {
+                "indexed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "project_root": str(project_root),
+                "indexed_files": stats["indexed_files"],
+                "metadata_only_files": stats["metadata_only_files"],
+                "removed_files": stats["removed_files"],
+                "skipped_large_files": stats["skipped_large_files"],
+                "lockfile_metadata_only_files": stats["lockfile_metadata_only_files"],
+                "excluded_files": stats["excluded_files"],
+                "total_chunks": stats["total_chunks"],
+                "estimated_source_tokens": stats["estimated_source_tokens"],
+                "max_file_size_bytes": int(config["max_file_size_bytes"]),
+                "max_read_lines": int(config["max_read_lines"]),
+                "max_read_characters": int(config["max_read_characters"]),
+            }
+
+            embedding_status = None
+            embedding_failure = None
+            embedding_manifest = previous_manifest.get("embedding") if isinstance(previous_manifest, dict) else None
+            if not dry_run:
+                # Embeddings are deliberately a second transaction after text indexing.
+                try:
+                    mode = self.engine.search.resolve_retrieval_mode() if self.engine is not None else "bm25"
+                    if mode == "hybrid":
+                        if store is None:
+                            raise RuntimeError("source_store_unavailable")
+                        model_name = self.engine.resolve_embedding_model()
+                        current_chunks = store.iter_chunks()
+                        if current_chunks:
+                            active = previous_manifest.get("embedding", {}) if isinstance(previous_manifest, dict) else {}
+                            active_model = active.get("model")
+                            try:
+                                active_dimension = int(active.get("dimension") or 0)
+                            except (TypeError, ValueError):
+                                active_dimension = 0
+                            existing_rows = store.conn.execute(
+                                "SELECT chunk_id, content_hash, embedding_dimension "
+                                "FROM source_embeddings WHERE embedding_model = ?",
+                                (model_name,),
+                            ).fetchall()
+                            existing_dimensions = {
+                                (row["chunk_id"], row["content_hash"]): int(row["embedding_dimension"])
+                                for row in existing_rows
+                            }
+                            probe = self.engine.search.embed([current_chunks[0]["document"]])
+                            if len(probe) != 1 or not probe[0]:
+                                raise ValueError("invalid_embedding_probe")
+                            observed_dimension = len(probe[0])
+                            if observed_dimension <= 0:
+                                raise ValueError("invalid_embedding_dimension")
+                            dimension = observed_dimension
+                            missing = [
+                                chunk
+                                for chunk in current_chunks
+                                if existing_dimensions.get((chunk["id"], chunk["content_hash"])) != dimension
+                            ]
+                            if active_model != model_name or active_dimension != dimension:
+                                missing = current_chunks
+                            if missing:
+                                vectors = self.engine.search.embed([chunk["document"] for chunk in missing])
+                                if len(vectors) != len(missing) or not vectors:
+                                    raise ValueError("invalid_embedding_batch")
+                                if any(not vector or len(vector) != dimension for vector in vectors):
+                                    raise ValueError("inconsistent_embedding_dimensions")
+                                if any(
+                                    not math.isfinite(float(value))
+                                    for vector in vectors
+                                    for value in vector
+                                ):
+                                    raise ValueError("non_finite_embedding")
+                                now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                generation = f"{model_name}:{dimension}"
+                                rows_to_write = [
+                                    {
+                                        "chunk_id": chunk["id"],
+                                        "embedding_generation": generation,
+                                        "embedding_model": model_name,
+                                        "embedding_dimension": dimension,
+                                        "content_hash": chunk["content_hash"],
+                                        "embedding": json.dumps([float(value) for value in vector]),
+                                        "created_at": now,
+                                    }
+                                    for chunk, vector in zip(missing, vectors)
+                                ]
+                                store.upsert_embeddings(rows_to_write)
+                            generation = f"{model_name}:{dimension}"
+                            stored = store.load_embeddings(model_name, dimension)
+                            if not all(
+                                (chunk["id"], chunk["content_hash"]) in stored
+                                for chunk in current_chunks
+                            ):
+                                raise ValueError("incomplete_embedding_generation")
+                            count = store.conn.execute(
+                                "SELECT COUNT(*) FROM source_embeddings "
+                                "WHERE embedding_generation = ?",
+                                (generation,),
+                            ).fetchone()[0]
+                            embedding_manifest = {
+                                "active_generation": generation,
+                                "model": model_name,
+                                "dimension": dimension,
+                                "status": "ready",
+                                "embedded_chunks": count,
+                            }
+                            embedding_status = "ready"
+                        else:
+                            embedding_status = "no_chunks"
+                    else:
+                        embedding_status = "bm25"
+                except Exception as exc:
+                    embedding_status = "bm25_fallback"
+                    embedding_failure = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(exc))[:80] or "embedding_unavailable"
+                manifest = {
+                    "version": "1.0.1",
+                    "corpus": "source",
+                    "config": config,
+                    "summary": summary,
+                    "files": manifest_files,
+                }
+                if embedding_manifest:
+                    manifest["embedding"] = embedding_manifest
+                manifest_path = self._manifest_path()
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = manifest_path.with_name(manifest_path.name + ".tmp")
+                try:
+                    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+                    os.replace(temporary, manifest_path)
+                finally:
+                    if temporary.exists():
+                        temporary.unlink()
+
+            stats["summary"] = summary
+            stats["warnings"] = []
+            if embedding_status:
+                stats["embedding_status"] = embedding_status
+            if embedding_failure:
+                stats["embedding_failure"] = embedding_failure
+                stats["warnings"].append(f"source_embedding_fallback:{embedding_failure}")
+            if dry_run:
+                stats["warnings"].append("dry_run_no_files_written")
+            return stats
 
     def _trim_content(self, content: str, max_characters: int) -> tuple[str, bool]:
         if len(content) <= max_characters:

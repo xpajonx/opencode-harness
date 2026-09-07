@@ -20,6 +20,7 @@ from oem_knowledge.memory_ranking import (
     build_ranking_debug_report,
 )
 from oem_knowledge.retrieval import normalize_record_fields, parse_iso_window, record_in_window
+from oem_knowledge.fs import FileLock
 
 if TYPE_CHECKING:
     from oem_knowledge.engine import KnowledgeEngine
@@ -33,6 +34,11 @@ class SearchService:
     def __init__(self, engine: KnowledgeEngine):
         self.engine = engine
         self._vector_store = None
+
+    def _index_lock(self) -> FileLock:
+        lock_path = self.engine._resolve_harness() / ".local_vector_db" / "index.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        return FileLock(lock_path, timeout=60.0)
 
     @property
     def model(self):
@@ -252,309 +258,310 @@ class SearchService:
             }
 
     def _index_all_impl(self, force: bool = False, progress_callback=None, budget_seconds: float | None = None, quiet: bool = False) -> dict:
-        harness = self.engine._resolve_harness()
-        wiki_dir = harness / "wiki"
+        with self._index_lock():
+            harness = self.engine._resolve_harness()
+            wiki_dir = harness / "wiki"
         
-        md_files = list(wiki_dir.rglob("*.md")) if wiki_dir.exists() else []
-        for folder in ["skills", "skill_candidates"]:
-            folder_dir = harness / folder
-            if folder_dir.exists():
-                md_files.extend(folder_dir.rglob("*.md"))
-        for f in harness.glob("*.md"):
-            if f.is_file():
-                md_files.append(f)
+            md_files = list(wiki_dir.rglob("*.md")) if wiki_dir.exists() else []
+            for folder in ["skills", "skill_candidates"]:
+                folder_dir = harness / folder
+                if folder_dir.exists():
+                    md_files.extend(folder_dir.rglob("*.md"))
+            for f in harness.glob("*.md"):
+                if f.is_file():
+                    md_files.append(f)
 
-        registry = {}
-        reg_path = harness / "state" / "file_registry.json"
-        if reg_path.exists():
-            try:
-                registry = json.loads(reg_path.read_text())
-            except (json.JSONDecodeError, OSError):
-                registry = {}
-
-        # Detect relative path migration
-        is_migration = False
-        if registry:
-            first_key = next(iter(registry.keys()))
-            if os.path.isabs(first_key):
-                is_migration = True
-                if not quiet:
-                    print("\n[OEM] Migrating search index registry to relative paths (one-time full re-index)...")
-                force = True
-
-        stats = {
-            "status": "success",
-            "scanned": len(md_files),
-            "new": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "failed": 0,
-            "new_chunks": 0,
-            "updated_chunks": 0,
-            "unchanged_chunks": 0,
-            "failed_chunks": 0,
-            "failed_files": [],
-            "deletes": 0,
-            "count_time_s": 0.0,
-            "chunk_time_s": 0.0,
-            "embed_time_s": 0.0,
-            "write_time_s": 0.0,
-            "index_time_ms": 0,
-        }
-        start_index_time = time.time()
-        active_paths = set()
-        new_registry = {}
-        to_index = []
-        failed_files = []
-
-        # 1. Count phase
-        t0 = time.time()
-        chunk_counts = {}
-        store = None
-        try:
-            store = self.vector_store
-            if store is None:
-                raise ValueError("Vector store failed to initialize")
-            chunk_counts = store.count_chunks_by_source_batch()
-        except Exception as e:
-            logger.error("Failed to initialize vector store or count chunks: %s", e)
-            stats["status"] = "error"
-            stats["error"] = f"Vector store initialization error: {e}"
-            stats["failed"] = len(md_files)
-            stats["failed_files"] = [str(fp.relative_to(harness.parent)) if fp.is_relative_to(harness.parent) else fp.name for fp in md_files]
-            return stats
-        stats["count_time_s"] = time.time() - t0
-
-        # 2. Chunk phase
-        t_chunk_start = time.time()
-        for fp in md_files:
-            if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
-                stats["status"] = "partial"
-                stats["error"] = "Indexing budget exceeded"
-                return stats
-            try:
-                rel_path = str(fp.relative_to(harness.parent))
-            except Exception:
-                rel_path = fp.name
-            path_str = rel_path
-            active_paths.add(path_str)
-            try:
-                cur_hash = self.calculate_sha256(fp)
-                old_hash = None if is_migration else registry.get(path_str)
-                new_registry[path_str] = cur_hash
-                if force or old_hash != cur_hash:
-                    stats["new" if old_hash is None else "updated"] += 1
-                    to_index.append((fp, path_str, old_hash, cur_hash))
-                else:
-                    stats["unchanged"] += 1
-                    stats["unchanged_chunks"] += chunk_counts.get(path_str, 0)
-            except Exception as e:
-                logger.warning("Failed to scan/hash file %s: %s", path_str, e)
-                stats["failed"] += 1
-                failed_files.append(path_str)
-                if path_str in registry:
-                    new_registry[path_str] = registry[path_str]
-
-        chunks_to_upsert = []
-        if to_index and store is not None:
-            retrieval_mode = self.resolve_retrieval_mode()
-            # Verify fastembed is installed for hybrid mode
-            if retrieval_mode == "hybrid":
+            registry = {}
+            reg_path = harness / "state" / "file_registry.json"
+            if reg_path.exists():
                 try:
-                    from fastembed import TextEmbedding
-                except ImportError:
-                    raise ImportError(
-                        "Hybrid search requires fastembed. Please install it with 'uv tool install \"git+https://github.com/xpajonx/openempiric.git#subdirectory=packages/oem-knowledge[semantic]\"' "
-                        "or switch to automatic/BM25 retrieval using 'oem config retrieval auto' or 'oem config retrieval bm25'."
-                    )
+                    registry = json.loads(reg_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    registry = {}
 
-            for idx, (fp, path_str, old_hash, cur_hash) in enumerate(to_index):
+            # Detect relative path migration
+            is_migration = False
+            if registry:
+                first_key = next(iter(registry.keys()))
+                if os.path.isabs(first_key):
+                    is_migration = True
+                    if not quiet:
+                        print("\n[OEM] Migrating search index registry to relative paths (one-time full re-index)...")
+                    force = True
+
+            stats = {
+                "status": "success",
+                "scanned": len(md_files),
+                "new": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "failed": 0,
+                "new_chunks": 0,
+                "updated_chunks": 0,
+                "unchanged_chunks": 0,
+                "failed_chunks": 0,
+                "failed_files": [],
+                "deletes": 0,
+                "count_time_s": 0.0,
+                "chunk_time_s": 0.0,
+                "embed_time_s": 0.0,
+                "write_time_s": 0.0,
+                "index_time_ms": 0,
+            }
+            start_index_time = time.time()
+            active_paths = set()
+            new_registry = {}
+            to_index = []
+            failed_files = []
+
+            # 1. Count phase
+            t0 = time.time()
+            chunk_counts = {}
+            store = None
+            try:
+                store = self.vector_store
+                if store is None:
+                    raise ValueError("Vector store failed to initialize")
+                chunk_counts = store.count_chunks_by_source_batch()
+            except Exception as e:
+                logger.error("Failed to initialize vector store or count chunks: %s", e)
+                stats["status"] = "error"
+                stats["error"] = f"Vector store initialization error: {e}"
+                stats["failed"] = len(md_files)
+                stats["failed_files"] = [str(fp.relative_to(harness.parent)) if fp.is_relative_to(harness.parent) else fp.name for fp in md_files]
+                return stats
+            stats["count_time_s"] = time.time() - t0
+
+            # 2. Chunk phase
+            t_chunk_start = time.time()
+            for fp in md_files:
                 if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
                     stats["status"] = "partial"
                     stats["error"] = "Indexing budget exceeded"
                     return stats
-                if progress_callback is not None:
-                    try:
-                        progress_callback(idx + 1, len(to_index))
-                    except Exception as e:
-                        logger.warning("Progress callback failed: %s", e)
-
                 try:
                     rel_path = str(fp.relative_to(harness.parent))
-                except Exception as e:
-                    logger.debug("Failed to calculate relative path for %s: %s", fp, e)
+                except Exception:
                     rel_path = fp.name
-
+                path_str = rel_path
+                active_paths.add(path_str)
                 try:
-                    content = fp.read_text(encoding="utf-8")
-                    classification = classify_source(fp, content=content)
-                    chunks = self.chunk_markdown(fp, rel_path)
-                    if not chunks:
-                        continue
-
-                    mtime = os.path.getmtime(fp)
-                    imp = self.derive_importance(rel_path)
-
-                    # Compute memory_type for this file's chunks
-                    doc_memory_type = "observation"
-                    try:
-                        from oem_knowledge.memory_ranking import classify_memory_type
-                        doc_memory_type = classify_memory_type(document=content)
-                    except Exception:
-                        pass
-
-                    for c in chunks:
-                        meta = {
-                            "source": path_str,
-                            "source_path": rel_path,
-                            "rel_path": rel_path,
-                            "source_type": classification.source_type,
-                            "ingestion_eligible": classification.ingestion_eligible,
-                            "title": c["title"],
-                            "content_hash": cur_hash,
-                            "linked_concepts": ",".join(c["linked_concepts"]),
-                            "created_at": str(mtime),
-                            "updated_at": str(mtime),
-                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime)),
-                            "importance": imp,
-                            "memory_type": doc_memory_type,
-                             "embedding_model": self.engine.resolve_embedding_model(),
-                        }
-                        # Propagate document-level metadata from frontmatter
-                        for fm_key in ("concept_id", "concept_status"):
-                            if c.get(fm_key):
-                                meta[fm_key] = c[fm_key]
-                        chunks_to_upsert.append({
-                            "chunk_id": c["chunk_id"],
-                            "text": c["text"],
-                            "meta": meta,
-                            "old_hash": old_hash
-                        })
-                except Exception as e:
-                    logger.warning("Failed to chunk file %s: %s", path_str, e)
-                    failed_files.append(path_str)
-                    stats["failed"] += 1
-        stats["chunk_time_s"] = time.time() - t_chunk_start
-
-        # 3. Embedding phase
-        t_embed_start = time.time()
-        retrieval_mode = self.resolve_retrieval_mode()
-        stats["effective_retrieval_mode"] = retrieval_mode
-        stats["model_available"] = self.engine.embedding_cache_ready() or self.model is not None
-        embeddings = []
-        if chunks_to_upsert and store is not None:
-            if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
-                stats["status"] = "partial"
-                stats["error"] = "Indexing budget exceeded"
-                return stats
-            if retrieval_mode == "hybrid":
-                if not stats["model_available"]:
-                    stats["status"] = "partial"
-                    stats["error"] = "Embedding model is not available in the local cache. Run `oem warmup`, then re-index."
-                    return stats
-                try:
-                    texts = [c["text"] for c in chunks_to_upsert]
-                    embeddings = self.embed(texts)
-                    for c, embedding in zip(chunks_to_upsert, embeddings):
-                        if embedding is not None:
-                            c["meta"]["embedding_dimension"] = len(embedding)
-                except Exception as e:
-                    logger.warning("Batch embedding generation error: %s", e)
-                    embeddings = [None] * len(chunks_to_upsert)
-            else:
-                embeddings = [None] * len(chunks_to_upsert)
-        stats["embed_time_s"] = time.time() - t_embed_start
-
-        # 4. SQLite write phase
-        t_write_start = time.time()
-        write_error = None
-        if store is not None:
-            if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
-                stats["status"] = "partial"
-                stats["error"] = "Indexing budget exceeded"
-                return stats
-            # Batch delete
-            sources_to_delete = [path_str for _, path_str, old_hash, _ in to_index if old_hash is not None and path_str not in failed_files]
-            if sources_to_delete:
-                try:
-                    store.delete_by_sources(sources_to_delete)
-                    stats["deletes"] += len(sources_to_delete)
-                except Exception as e:
-                    logger.error("Failed to delete stale chunks from database: %s", e)
-                    write_error = e
-
-            # Batch upsert
-            if chunks_to_upsert and not write_error:
-                batch_data = []
-                for idx, c in enumerate(chunks_to_upsert):
-                    batch_data.append((
-                        c["chunk_id"],
-                        c["text"],
-                        c["meta"],
-                        embeddings[idx]
-                    ))
-                    if c["old_hash"] is None:
-                        stats["new_chunks"] += 1
+                    cur_hash = self.calculate_sha256(fp)
+                    old_hash = None if is_migration else registry.get(path_str)
+                    new_registry[path_str] = cur_hash
+                    if force or old_hash != cur_hash:
+                        stats["new" if old_hash is None else "updated"] += 1
+                        to_index.append((fp, path_str, old_hash, cur_hash))
                     else:
-                        stats["updated_chunks"] += 1
-
-                try:
-                    store.upsert_batch(batch_data)
+                        stats["unchanged"] += 1
+                        stats["unchanged_chunks"] += chunk_counts.get(path_str, 0)
                 except Exception as e:
-                    logger.error("Batch upsert error: %s", e)
-                    stats["failed_chunks"] += len(chunks_to_upsert)
+                    logger.warning("Failed to scan/hash file %s: %s", path_str, e)
+                    stats["failed"] += 1
+                    failed_files.append(path_str)
+                    if path_str in registry:
+                        new_registry[path_str] = registry[path_str]
+
+            chunks_to_upsert = []
+            if to_index and store is not None:
+                retrieval_mode = self.resolve_retrieval_mode()
+                # Verify fastembed is installed for hybrid mode
+                if retrieval_mode == "hybrid":
+                    try:
+                        from fastembed import TextEmbedding
+                    except ImportError:
+                        raise ImportError(
+                            "Hybrid search requires fastembed. Please install it with 'uv tool install \"git+https://github.com/xpajonx/openempiric.git#subdirectory=packages/oem-knowledge[semantic]\"' "
+                            "or switch to automatic/BM25 retrieval using 'oem config retrieval auto' or 'oem config retrieval bm25'."
+                        )
+
+                for idx, (fp, path_str, old_hash, cur_hash) in enumerate(to_index):
+                    if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
+                        stats["status"] = "partial"
+                        stats["error"] = "Indexing budget exceeded"
+                        return stats
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(idx + 1, len(to_index))
+                        except Exception as e:
+                            logger.warning("Progress callback failed: %s", e)
+
+                    try:
+                        rel_path = str(fp.relative_to(harness.parent))
+                    except Exception as e:
+                        logger.debug("Failed to calculate relative path for %s: %s", fp, e)
+                        rel_path = fp.name
+
+                    try:
+                        content = fp.read_text(encoding="utf-8")
+                        classification = classify_source(fp, content=content)
+                        chunks = self.chunk_markdown(fp, rel_path)
+                        if not chunks:
+                            continue
+
+                        mtime = os.path.getmtime(fp)
+                        imp = self.derive_importance(rel_path)
+
+                        # Compute memory_type for this file's chunks
+                        doc_memory_type = "observation"
+                        try:
+                            from oem_knowledge.memory_ranking import classify_memory_type
+                            doc_memory_type = classify_memory_type(document=content)
+                        except Exception:
+                            pass
+
+                        for c in chunks:
+                            meta = {
+                                "source": path_str,
+                                "source_path": rel_path,
+                                "rel_path": rel_path,
+                                "source_type": classification.source_type,
+                                "ingestion_eligible": classification.ingestion_eligible,
+                                "title": c["title"],
+                                "content_hash": cur_hash,
+                                "linked_concepts": ",".join(c["linked_concepts"]),
+                                "created_at": str(mtime),
+                                "updated_at": str(mtime),
+                                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime)),
+                                "importance": imp,
+                                "memory_type": doc_memory_type,
+                                 "embedding_model": self.engine.resolve_embedding_model(),
+                            }
+                            # Propagate document-level metadata from frontmatter
+                            for fm_key in ("concept_id", "concept_status"):
+                                if c.get(fm_key):
+                                    meta[fm_key] = c[fm_key]
+                            chunks_to_upsert.append({
+                                "chunk_id": c["chunk_id"],
+                                "text": c["text"],
+                                "meta": meta,
+                                "old_hash": old_hash
+                            })
+                    except Exception as e:
+                        logger.warning("Failed to chunk file %s: %s", path_str, e)
+                        failed_files.append(path_str)
+                        stats["failed"] += 1
+            stats["chunk_time_s"] = time.time() - t_chunk_start
+
+            # 3. Embedding phase
+            t_embed_start = time.time()
+            retrieval_mode = self.resolve_retrieval_mode()
+            stats["effective_retrieval_mode"] = retrieval_mode
+            stats["model_available"] = self.engine.embedding_cache_ready() or self.model is not None
+            embeddings = []
+            if chunks_to_upsert and store is not None:
+                if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
+                    stats["status"] = "partial"
+                    stats["error"] = "Indexing budget exceeded"
+                    return stats
+                if retrieval_mode == "hybrid":
+                    if not stats["model_available"]:
+                        stats["status"] = "partial"
+                        stats["error"] = "Embedding model is not available in the local cache. Run `oem warmup`, then re-index."
+                        return stats
+                    try:
+                        texts = [c["text"] for c in chunks_to_upsert]
+                        embeddings = self.embed(texts)
+                        for c, embedding in zip(chunks_to_upsert, embeddings):
+                            if embedding is not None:
+                                c["meta"]["embedding_dimension"] = len(embedding)
+                    except Exception as e:
+                        logger.warning("Batch embedding generation error: %s", e)
+                        embeddings = [None] * len(chunks_to_upsert)
+                else:
+                    embeddings = [None] * len(chunks_to_upsert)
+            stats["embed_time_s"] = time.time() - t_embed_start
+
+            # 4. SQLite write phase
+            t_write_start = time.time()
+            write_error = None
+            if store is not None:
+                if budget_seconds is not None and (time.time() - start_index_time) >= budget_seconds:
+                    stats["status"] = "partial"
+                    stats["error"] = "Indexing budget exceeded"
+                    return stats
+                # Batch delete
+                sources_to_delete = [path_str for _, path_str, old_hash, _ in to_index if old_hash is not None and path_str not in failed_files]
+                if sources_to_delete:
+                    try:
+                        store.delete_by_sources(sources_to_delete)
+                        stats["deletes"] += len(sources_to_delete)
+                    except Exception as e:
+                        logger.error("Failed to delete stale chunks from database: %s", e)
+                        write_error = e
+
+                # Batch upsert
+                if chunks_to_upsert and not write_error:
+                    batch_data = []
+                    for idx, c in enumerate(chunks_to_upsert):
+                        batch_data.append((
+                            c["chunk_id"],
+                            c["text"],
+                            c["meta"],
+                            embeddings[idx]
+                        ))
+                        if c["old_hash"] is None:
+                            stats["new_chunks"] += 1
+                        else:
+                            stats["updated_chunks"] += 1
+
+                    try:
+                        store.upsert_batch(batch_data)
+                    except Exception as e:
+                        logger.error("Batch upsert error: %s", e)
+                        stats["failed_chunks"] += len(chunks_to_upsert)
+                        write_error = e
+
+                # Handle deleted paths
+                deleted_paths = set(registry.keys()) - active_paths
+                if deleted_paths and not write_error:
+                    try:
+                        store.delete_by_sources(list(deleted_paths))
+                        stats["deletes"] += len(deleted_paths)
+                    except Exception as e:
+                        logger.error("Failed to delete removed paths from database: %s", e)
+                        write_error = e
+            stats["write_time_s"] = time.time() - t_write_start
+
+            # Only update registry if write succeeded
+            if not write_error:
+                try:
+                    reg_path.parent.mkdir(parents=True, exist_ok=True)
+                    reg_path.write_text(json.dumps(new_registry, indent=2))
+                except Exception as e:
+                    logger.error("Failed to write search file registry: %s", e)
                     write_error = e
 
-            # Handle deleted paths
-            deleted_paths = set(registry.keys()) - active_paths
-            if deleted_paths and not write_error:
-                try:
-                    store.delete_by_sources(list(deleted_paths))
-                    stats["deletes"] += len(deleted_paths)
-                except Exception as e:
-                    logger.error("Failed to delete removed paths from database: %s", e)
-                    write_error = e
-        stats["write_time_s"] = time.time() - t_write_start
+            total_time = time.time() - start_index_time
+            stats["index_time_ms"] = int(total_time * 1000)
 
-        # Only update registry if write succeeded
-        if not write_error:
-            try:
-                reg_path.parent.mkdir(parents=True, exist_ok=True)
-                reg_path.write_text(json.dumps(new_registry, indent=2))
-            except Exception as e:
-                logger.error("Failed to write search file registry: %s", e)
-                write_error = e
+            # Output the print instrumentation
+            total_chunks = stats["new_chunks"] + stats["updated_chunks"] + stats["unchanged_chunks"]
+            if not quiet:
+                print(f"\nIndex Profile:")
+                print(f"  Files scanned:       {stats['scanned']}")
+                print(f"  Chunks total:        {total_chunks}")
+                print(f"  New chunks:          {stats['new_chunks']}")
+                print(f"  Updated chunks:      {stats['updated_chunks']}")
+                print(f"  Unchanged chunks:    {stats['unchanged_chunks']}")
+                print(f"  Deletes:             {stats['deletes']}")
+                print(f"  Count phase:         {stats['count_time_s']:.2f}s")
+                print(f"  Chunk phase:         {stats['chunk_time_s']:.2f}s")
+                print(f"  Embedding phase:     {stats['embed_time_s']:.2f}s")
+                print(f"  SQLite write phase:  {stats['write_time_s']:.2f}s")
+                print(f"  Total:               {total_time:.2f}s")
 
-        total_time = time.time() - start_index_time
-        stats["index_time_ms"] = int(total_time * 1000)
+            if write_error:
+                stats["status"] = "error"
+                stats["error"] = str(write_error)
+                stats["failed_files"] = failed_files
+            elif failed_files:
+                stats["status"] = "partial"
+                stats["failed_files"] = failed_files
+            else:
+                stats["status"] = "success"
 
-        # Output the print instrumentation
-        total_chunks = stats["new_chunks"] + stats["updated_chunks"] + stats["unchanged_chunks"]
-        if not quiet:
-            print(f"\nIndex Profile:")
-            print(f"  Files scanned:       {stats['scanned']}")
-            print(f"  Chunks total:        {total_chunks}")
-            print(f"  New chunks:          {stats['new_chunks']}")
-            print(f"  Updated chunks:      {stats['updated_chunks']}")
-            print(f"  Unchanged chunks:    {stats['unchanged_chunks']}")
-            print(f"  Deletes:             {stats['deletes']}")
-            print(f"  Count phase:         {stats['count_time_s']:.2f}s")
-            print(f"  Chunk phase:         {stats['chunk_time_s']:.2f}s")
-            print(f"  Embedding phase:     {stats['embed_time_s']:.2f}s")
-            print(f"  SQLite write phase:  {stats['write_time_s']:.2f}s")
-            print(f"  Total:               {total_time:.2f}s")
-
-        if write_error:
-            stats["status"] = "error"
-            stats["error"] = str(write_error)
-            stats["failed_files"] = failed_files
-        elif failed_files:
-            stats["status"] = "partial"
-            stats["failed_files"] = failed_files
-        else:
-            stats["status"] = "success"
-
-        return stats
+            return stats
 
     def index_concept_events(self, concept_id: str, project: str | None = None) -> int:
         """Index all events for a concept as individual searchable chunks.
@@ -587,17 +594,18 @@ class SearchService:
                 "embedding_model": self.engine.resolve_embedding_model(),
             }
             chunks_to_upsert.append((chunk_id, document, meta))
-        if chunks_to_upsert:
-            texts = [c[1] for c in chunks_to_upsert]
-            if self.resolve_retrieval_mode() == "hybrid":
-                embeddings = self.embed(texts)
-                for c, embedding in zip(chunks_to_upsert, embeddings):
-                    if embedding is not None:
-                        c[2]["embedding_dimension"] = len(embedding)
-            else:
-                embeddings = [None] * len(texts)
-            batch = [(cid, doc, meta, emb) for (cid, doc, meta), emb in zip(chunks_to_upsert, embeddings)]
-            store.upsert_batch(batch)
+        with self._index_lock():
+            if chunks_to_upsert:
+                texts = [c[1] for c in chunks_to_upsert]
+                if self.resolve_retrieval_mode() == "hybrid":
+                    embeddings = self.embed(texts)
+                    for c, embedding in zip(chunks_to_upsert, embeddings):
+                        if embedding is not None:
+                            c[2]["embedding_dimension"] = len(embedding)
+                else:
+                    embeddings = [None] * len(texts)
+                batch = [(cid, doc, meta, emb) for (cid, doc, meta), emb in zip(chunks_to_upsert, embeddings)]
+                store.upsert_batch(batch)
         return len(chunks_to_upsert)
 
     def index_all_events(self, project: str | None = None) -> dict:
@@ -631,57 +639,59 @@ class SearchService:
             return stats
         events = []
         rejected = 0
-        with open(user_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except (json.JSONDecodeError, TypeError):
-                    rejected += 1
-                    continue
-                if not isinstance(ev, dict):
-                    rejected += 1
-                    continue
-                ev_id = ev.get("event_id") or ev.get("id")
-                if not ev_id:
-                    rejected += 1
-                    continue
-                summary = str(ev.get("summary") or ev.get("evidence") or "")
-                if not summary or is_ingestion_noise_event(ev):
-                    rejected += 1
-                    continue
-                memory_type = ev.get("event_type") or ev.get("type") or "observation"
-                timestamp = str(ev.get("timestamp") or "")
-                events.append((
-                    f"user#{ev_id}",
-                    f"Type: {memory_type}\n{summary}",
-                    {
-                        "source": USER_EVENTS_SOURCE,
-                        "scope": "user",
-                        "memory_type": memory_type,
-                        "timestamp": timestamp,
-                        "created_at": timestamp,
-                        "project": str(ev.get("project", "") or ""),
-                        "session_id": str(ev.get("session_id", "") or ""),
-                        "provenance": "user_events",
-                        "embedding_model": self.engine.resolve_embedding_model(),
-                    },
-                ))
+        with FileLock(user_path.with_suffix(".lock"), timeout=60.0):
+            with open(user_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        rejected += 1
+                        continue
+                    if not isinstance(ev, dict):
+                        rejected += 1
+                        continue
+                    ev_id = ev.get("event_id") or ev.get("id")
+                    if not ev_id:
+                        rejected += 1
+                        continue
+                    summary = str(ev.get("summary") or ev.get("evidence") or "")
+                    if not summary or is_ingestion_noise_event(ev):
+                        rejected += 1
+                        continue
+                    memory_type = ev.get("event_type") or ev.get("type") or "observation"
+                    timestamp = str(ev.get("timestamp") or "")
+                    events.append((
+                        f"user#{ev_id}",
+                        f"Type: {memory_type}\n{summary}",
+                        {
+                            "source": USER_EVENTS_SOURCE,
+                            "scope": "user",
+                            "memory_type": memory_type,
+                            "timestamp": timestamp,
+                            "created_at": timestamp,
+                            "project": str(ev.get("project", "") or ""),
+                            "session_id": str(ev.get("session_id", "") or ""),
+                            "provenance": "user_events",
+                            "embedding_model": self.engine.resolve_embedding_model(),
+                        },
+                    ))
         if budget_seconds is not None and (time.time() - start) >= budget_seconds:
             stats["status"] = "partial"
             stats["reason"] = "Indexing budget exceeded"
             stats["rejected"] = rejected
             return stats
-        try:
-            store = self.vector_store
-            store.delete_by_source(USER_EVENTS_SOURCE)
-        except Exception as e:
-            stats["status"] = "partial"
-            stats["reason"] = f"user chunk cleanup failed: {e}"
-            return stats
         if not events:
+            try:
+                with self._index_lock():
+                    store = self.vector_store
+                    store.delete_by_source(USER_EVENTS_SOURCE)
+            except Exception as e:
+                stats["status"] = "partial"
+                stats["reason"] = f"user chunk cleanup failed: {e}"
+                return stats
             stats["rejected"] = rejected
             return stats
         try:
@@ -692,7 +702,10 @@ class SearchService:
                         event[2]["embedding_dimension"] = len(embedding)
             else:
                 embeddings = [None] * len(events)
-            store.upsert_batch([(cid, doc, meta, emb) for (cid, doc, meta), emb in zip(events, embeddings)])
+            with self._index_lock():
+                store = self.vector_store
+                store.delete_by_source(USER_EVENTS_SOURCE)
+                store.upsert_batch([(cid, doc, meta, emb) for (cid, doc, meta), emb in zip(events, embeddings)])
             stats["indexed"] = len(events)
             stats["rejected"] = rejected
         except Exception as e:

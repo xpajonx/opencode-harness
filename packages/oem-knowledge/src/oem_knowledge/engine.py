@@ -956,7 +956,58 @@ class KnowledgeEngine:
             for key in ("load_state", "reflection", "append_events", "materialization", "search_index", "write_report", "cleanup", "total")
         }
 
+    # The single per-project intent log requires one owner for the complete
+    # session pipeline; this is the safe bounded seam.
     def session_end(
+        self,
+        project: str | None = None,
+        conversation_text: str = "",
+        session_id: str = "",
+        telemetry: dict | None = None,
+        session_started_at: float | None = None,
+        update_index: bool = True,
+        index_budget_seconds: float | None = 10.0,
+        progress_callback = None,
+        events: list[dict] | None = None,
+        extraction_mode: str = "auto",
+        timeout_seconds: float | None = None,
+    ) -> dict:
+        from oem_knowledge.fs import FileLock, LockTimeoutError
+        from oem_knowledge.runtime.result import error
+
+        commit_lock_path = self._resolve_harness(project) / "commit.lock"
+        try:
+            with FileLock(commit_lock_path, timeout=60.0):
+                return self._session_end_unlocked(
+                    project=project,
+                    conversation_text=conversation_text,
+                    session_id=session_id,
+                    telemetry=telemetry,
+                    session_started_at=session_started_at,
+                    update_index=update_index,
+                    index_budget_seconds=index_budget_seconds,
+                    progress_callback=progress_callback,
+                    events=events,
+                    extraction_mode=extraction_mode,
+                    timeout_seconds=timeout_seconds,
+                )
+        except LockTimeoutError as e:
+            return error(
+                operation="session_end",
+                message=f"Lock acquisition timeout: {e}",
+                failed_step="commit_lock",
+                warnings=[f"Lock failure: Commit lock contention on file. {e}"],
+                data={
+                    "report_path": None,
+                    "knowledge_events": [],
+                    "materialized_log": [],
+                    "links_updated": 0,
+                    "index_stats": {},
+                    "explainability": {},
+                },
+            )
+
+    def _session_end_unlocked(
         self,
         project: str | None = None,
         conversation_text: str = "",
@@ -1727,6 +1778,21 @@ project: {project or "default"}
         return self.session_end(*args, **kwargs)
 
     def dream(self, project: str | None = None, force: bool = False, index_budget_seconds: float | None = None) -> dict:
+        """Run dream while serializing concept-registry read-modify-write state."""
+        from oem_knowledge.fs import FileLock
+
+        registry_lock = FileLock(
+            self._registry_path(project).with_suffix(".lock"),
+            timeout=60.0,
+        )
+        with registry_lock:
+            return self._dream_unlocked(
+                project=project,
+                force=force,
+                index_budget_seconds=index_budget_seconds,
+            )
+
+    def _dream_unlocked(self, project: str | None = None, force: bool = False, index_budget_seconds: float | None = None) -> dict:
         """Run the memory maintainer dream cycle.
         
         Four phases:
@@ -1740,7 +1806,7 @@ project: {project or "default"}
         )
 
         harness = self._resolve_harness(project)
-        registry = self._load_registry(project) if hasattr(self, '_load_registry') else self.state._load_registry(project)
+        registry = self.state._load_registry(project, lock=False)
         events = self.state.get_events(project)
         config = self._read_reflection_config(project)
         reflection_cfg = config.get("reflection", {})
@@ -1795,7 +1861,11 @@ project: {project or "default"}
                 archival_candidates.append({"concept_id": cid, "reason": arch_reason})
 
         try:
-            merge_proposals = self.propose_merges(similarity_threshold=consolidate_threshold, project=project)
+            merge_proposals = self.propose_merges(
+                similarity_threshold=consolidate_threshold,
+                project=project,
+                lock=False,
+            )
             merge_candidates = merge_proposals if merge_proposals else []
         except Exception as e:
             logger.warning("Merge proposal failed during dream: %s", e)
@@ -1838,21 +1908,25 @@ project: {project or "default"}
                 archives_applied += 1
                 dream_log.record("archive", {"concept_id": cid, "from_status": old_status})
 
+        # Save non-merge changes before merge_concepts writes the registry.
+        registry_changed = decays_applied > 0 or promotions_applied > 0 or archives_applied > 0
+        if registry_changed:
+            self.state._save_registry(registry, project, lock=False)
+
         # Apply merges
         for mc in merge_candidates:
             primary_id = mc.get("primary_id")
             secondary_id = mc.get("secondary_id")
             if primary_id and secondary_id and primary_id in registry and secondary_id in registry:
                 try:
-                    self.state.merge_concepts(project, primary_id, secondary_id)
+                    self.state.merge_concepts(project, primary_id, secondary_id, lock=False)
                     merges_applied += 1
                     dream_log.record("merge", {"primary_id": primary_id, "secondary_id": secondary_id})
                 except Exception as e:
                     logger.warning("Merge failed for %s -> %s: %s", secondary_id, primary_id, e)
 
-        # Save registry (only if changes were made)
-        if decays_applied > 0 or promotions_applied > 0 or archives_applied > 0:
-            self.state._save_registry(registry, project)
+        if merges_applied > 0:
+            registry = self.state._load_registry(project, lock=False)
 
         # Phase 4: Pruning (bounded when a budget is supplied; skipped at zero)
         index_res = {"status": "success"}
@@ -2016,10 +2090,16 @@ project: {project or "default"}
         auto_dream = reflection.get("auto_dream", {})
         return bool(auto_dream.get("enabled", False))
 
-    def propose_merges(self, similarity_threshold: float = 0.85, project: str | None = None) -> list[dict]:
+    def propose_merges(
+        self,
+        similarity_threshold: float = 0.85,
+        project: str | None = None,
+        *,
+        lock: bool = True,
+    ) -> list[dict]:
         from oem_knowledge.evolution import ConceptEvolutionEngine
         ev = ConceptEvolutionEngine(self)
-        return ev.propose_merges(similarity_threshold, project)
+        return ev.propose_merges(similarity_threshold, project, lock=lock)
 
     def detect_contradictions(self, project: str | None = None) -> list[dict]:
         from oem_knowledge.evolution import ContradictionDetector
